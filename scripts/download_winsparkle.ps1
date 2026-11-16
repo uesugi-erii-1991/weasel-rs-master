@@ -1,0 +1,52 @@
+#Requires -Version 5.1
+[CmdletBinding()]
+param()
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+$version = '0.9.4'
+$expected = '6037df37fc263bd1650a1c4949681a9d40ffe991d01f35892a406cb5d103c976'
+$directory = Join-Path (Split-Path -Parent $PSScriptRoot) 'artifacts\winsparkle'
+$archive = Join-Path $directory "WinSparkle-$version.zip"
+$temporary = Join-Path $directory "WinSparkle-$version.download"
+
+try {
+    $null = New-Item -ItemType Directory -Force -Path $directory
+    if (-not (Test-Path -LiteralPath $archive -PathType Leaf)) {
+        # $url = "https://github.com/vslavik/winsparkle/releases/download/v$version/WinSparkle-$version.zip"
+        $url = "https://cors.isteed.cc/github.com/vslavik/winsparkle/releases/download/v$version/WinSparkle-$version.zip"
+        
+        # https://cors.isteed.cc/github.com/vslavik/winsparkle/releases/download/v0.9.4/WinSparkle-0.9.4.zip
+        Invoke-WebRequest -Uri $url -OutFile $temporary -TimeoutSec 300 -MaximumRedirection 10
+        $actual = (Get-FileHash -LiteralPath $temporary -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($actual -ne $expected) { throw "WinSparkle SHA-256 mismatch: expected $expected, actual $actual" }
+        Move-Item -LiteralPath $temporary -Destination $archive
+    }
+    $actual = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($actual -ne $expected) { throw "WinSparkle SHA-256 mismatch: expected $expected, actual $actual" }
+
+    Add-Type -AssemblyName System.IO.Compression
+    $zip = [IO.Compression.ZipFile]::OpenRead($archive)
+    try {
+        $entries = @{
+            "WinSparkle-$version/x64/Release/WinSparkle.dll" = 'x64\WinSparkle.dll'
+            "WinSparkle-$version/ARM64/Release/WinSparkle.dll" = 'arm64\WinSparkle.dll'
+            "WinSparkle-$version/bin/winsparkle-tool.exe" = 'winsparkle-tool.exe'
+            "WinSparkle-$version/COPYING" = 'WinSparkle-LICENSE.txt'
+            "WinSparkle-$version/COPYING.expat" = 'WinSparkle-Expat-LICENSE.txt'
+        }
+        foreach ($entryName in $entries.Keys) {
+            $entry = $zip.GetEntry($entryName)
+            if ($null -eq $entry) { throw "Missing WinSparkle archive entry: $entryName" }
+            $destination = Join-Path $directory $entries[$entryName]
+            $null = New-Item -ItemType Directory -Force -Path (Split-Path -Parent $destination)
+            $source = $entry.Open()
+            $output = [IO.File]::Create($destination)
+            try { $source.CopyTo($output) }
+            finally { $output.Dispose(); $source.Dispose() }
+        }
+    } finally { $zip.Dispose() }
+    Write-Host "WinSparkle ${version}: SHA-256 verified; x64/ARM64 DLLs, signing tool and licenses staged."
+} finally {
+    if (Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary -Force }
+}

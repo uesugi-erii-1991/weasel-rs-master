@@ -1,0 +1,170 @@
+fn main() {
+    build_identity();
+    let out = std::path::PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR is set"));
+    windows_bindgen::builder()
+        .output(out.join("bindings.rs"))
+        .input_default()
+        .filters([
+            "Windows.Win32.GetKeyState",
+            "Windows.Win32.GetNamedPipeClientProcessId",
+            "Windows.Win32.GetNamedPipeServerProcessId",
+            "Windows.Win32.CoCreateGuid",
+            "Windows.Win32.CoInitializeEx",
+            "Windows.Win32.CoUninitialize",
+            "Windows.Win32.COINIT_APARTMENTTHREADED",
+            "Windows.Win32.RoInitialize",
+            "Windows.Win32.RoUninitialize",
+            "Windows.Win32.RO_INIT_SINGLETHREADED",
+            "Windows.Win32.GetProcessTimes",
+            "Windows.Win32.CreateEventW",
+            "Windows.Win32.OpenEventW",
+            "Windows.Win32.SetEvent",
+            "Windows.Win32.WaitForMultipleObjects",
+            "Windows.Win32.WaitForSingleObject",
+            "Windows.Win32.SYNCHRONIZE",
+            "Windows.Win32.OpenProcess",
+            "Windows.Win32.PROCESS_QUERY_LIMITED_INFORMATION",
+            "Windows.Win32.QueryFullProcessImageNameW",
+            "Windows.Win32.VK_SHIFT",
+            "Windows.Win32.MessageBoxW",
+            "Windows.Win32.MB_OK",
+            "Windows.Win32.MB_SETFOREGROUND",
+            "Windows.Win32.TaskDialogIndirect",
+            "Windows.Win32.TASKDIALOGCONFIG",
+            "Windows.Win32.TDF_EXPANDED_BY_DEFAULT",
+            "Windows.Win32.TDF_ENABLE_HYPERLINKS",
+            "Windows.Win32.TDF_POSITION_RELATIVE_TO_WINDOW",
+            "Windows.Win32.TDF_SHOW_MARQUEE_PROGRESS_BAR",
+            "Windows.Win32.TDF_SIZE_TO_CONTENT",
+            "Windows.Win32.TDCBF_CANCEL_BUTTON",
+            "Windows.Win32.TDCBF_OK_BUTTON",
+            "Windows.Win32.TDM_ENABLE_BUTTON",
+            "Windows.Win32.TDM_SET_ELEMENT_TEXT",
+            "Windows.Win32.TDM_SET_MARQUEE_PROGRESS_BAR",
+            "Windows.Win32.TDM_SET_PROGRESS_BAR_POS",
+            "Windows.Win32.TDM_SET_PROGRESS_BAR_MARQUEE",
+            "Windows.Win32.TDN_CREATED",
+            "Windows.Win32.TDN_DESTROYED",
+            "Windows.Win32.TDN_HYPERLINK_CLICKED",
+            "Windows.Win32.TDE_MAIN_INSTRUCTION",
+            "Windows.Win32.TDE_CONTENT",
+            "Windows.Win32.TDE_EXPANDED_INFORMATION",
+            "Windows.Win32.TDE_FOOTER",
+            "Windows.Win32.TD_ERROR_ICON",
+            "Windows.Win32.TD_INFORMATION_ICON",
+            "Windows.Win32.TD_WARNING_ICON",
+            "Windows.Win32.SendMessageW",
+            "Windows.Win32.ShellExecuteW",
+            "Windows.Win32.SW_SHOWNORMAL",
+            "Windows.Win32.IDOK",
+            "Windows.Win32.IDCANCEL",
+            "Windows.Win32.GetCurrentProcess",
+            "Windows.Win32.OpenProcessToken",
+            "Windows.Win32.GetTokenInformation",
+            "Windows.Win32.ConvertSidToStringSidW",
+            "Windows.Win32.ConvertStringSecurityDescriptorToSecurityDescriptorW",
+            "Windows.Win32.ConvertSecurityDescriptorToStringSecurityDescriptorW",
+            "Windows.Win32.GetSecurityInfo",
+            "Windows.Win32.CloseHandle",
+            "Windows.Win32.LocalFree",
+            "Windows.Win32.CreateMutexW",
+            "Windows.Win32.GetLastError",
+            "Windows.Win32.ERROR_PIPE_BUSY",
+            "Windows.Win32.TOKEN_USER",
+            "Windows.Win32.TOKEN_GROUPS",
+            "Windows.Win32.TOKEN_QUERY",
+            "Windows.Win32.TokenUser",
+            "Windows.Win32.TokenLogonSid",
+            "Windows.Win32.SE_GROUP_LOGON_ID",
+            "Windows.Win32.SDDL_REVISION_1",
+            "Windows.Win32.SECURITY_ATTRIBUTES",
+            "Windows.Win32.ERROR_ALREADY_EXISTS",
+            "Windows.Win32.ERROR_INVALID_PARAMETER",
+            "Windows.Win32.DACL_SECURITY_INFORMATION",
+            "Windows.Win32.SACL_SECURITY_INFORMATION",
+            "Windows.Win32.LABEL_SECURITY_INFORMATION",
+            "Windows.Win32.SE_KERNEL_OBJECT",
+        ])
+        .flat()
+        .write();
+    println!("cargo:rerun-if-changed=build.rs");
+    let protoc = protoc_bin_vendored::protoc_bin_path().expect("protoc is available");
+    unsafe { std::env::set_var("PROTOC", protoc) };
+
+    println!("cargo:rerun-if-changed=proto/broker.proto");
+    println!("cargo:rerun-if-changed=proto/common.proto");
+    println!("cargo:rerun-if-changed=proto/deploy.proto");
+    println!("cargo:rerun-if-changed=proto/renderer.proto");
+    println!("cargo:rerun-if-changed=proto/rpc.proto");
+    println!("cargo:rerun-if-changed=proto/tip.proto");
+    prost_build::compile_protos(
+        &[
+            "proto/broker.proto",
+            "proto/common.proto",
+            "proto/deploy.proto",
+            "proto/renderer.proto",
+            "proto/rpc.proto",
+            "proto/tip.proto",
+        ],
+        &["proto"],
+    )
+    .expect("protobuf definitions compile");
+}
+
+fn build_identity() {
+    use std::{
+        process::Command,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
+    let git = |args: &[&str]| {
+        Command::new("git")
+            .args(args)
+            .current_dir(&root)
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+    };
+    let revision = git(&["rev-parse", "HEAD"]).unwrap_or_else(|| "unknown".into());
+    let dirty = git(&["status", "--porcelain", "--untracked-files=normal"])
+        .map(|status| if status.is_empty() { "clean" } else { "dirty" })
+        .unwrap_or("unknown");
+    let epoch = std::env::var("SOURCE_DATE_EPOCH").unwrap_or_else(|_| {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+            .to_string()
+    });
+    println!("cargo:rustc-env=WEASEL_BUILD_REVISION={revision}");
+    println!("cargo:rustc-env=WEASEL_BUILD_STATE={dirty}");
+    println!("cargo:rustc-env=WEASEL_BUILD_EPOCH={epoch}");
+    let date = epoch.parse::<i64>().ok().and_then(|seconds| {
+        Command::new("powershell.exe").args(["-NoProfile", "-NonInteractive", "-Command",
+            &format!("[DateTimeOffset]::FromUnixTimeSeconds({seconds}).UtcDateTime.ToString('yyyy-MM-dd HH:mm:ss')")])
+            .output().ok().filter(|output| output.status.success())
+            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+    }).unwrap_or_else(|| format!("Unix seconds {epoch}"));
+    println!("cargo:rustc-env=WEASEL_BUILD_DATE={date}");
+    println!(
+        "cargo:rustc-env=WEASEL_BUILD_TARGET={}",
+        std::env::var("TARGET").unwrap()
+    );
+    println!("cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH");
+    for path in [
+        ".git/HEAD",
+        ".git/index",
+        ".git/refs",
+        ".git/packed-refs",
+        "tip",
+        "broker",
+        "common",
+        "renderer",
+        "server",
+        "build_support",
+        "Cargo.lock",
+    ] {
+        println!("cargo:rerun-if-changed={}", root.join(path).display());
+    }
+}

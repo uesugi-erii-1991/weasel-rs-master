@@ -1,0 +1,8 @@
+/target/
+/artifacts/
+node_modules/
+/themes/wasm/sdk-rust/target/
+/.wrangler/
+.trae-html-share-packages/
+.screenshots/
+graphify-out/

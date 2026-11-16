@@ -1,0 +1,20 @@
+[workspace]
+resolver = "2"
+members = [
+    "tip",
+    "broker",
+    "server",
+    "renderer",
+    "settings",
+    "common",
+    "theme-api",
+    "themes/support",
+    "themes/ten",
+    "themes/eleven",
+    "themes/abc",
+    "themes/void",
+    "themes/wasm",
+]
+
+[workspace.package]
+license = "BSD-3-Clause"

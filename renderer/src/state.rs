@@ -1,0 +1,427 @@
+//! 管理渲染连接的所有权、待呈现快照及其输入边界。
+
+use weasel_common::message::RenderSnapshot;
+
+/// 渲染连接的单调递增所有者编号。
+pub type Owner = u64;
+// Matches common InputState's candidate limit; retain separate text/geometry bounds.
+const MAX_ITEMS: usize = 256;
+
+/// 在线程间协调渲染连接与 UI 呈现的最新状态。
+///
+/// 新连接以更大的 `Owner` 接管邮箱后，旧连接不能重新取得所有权。`pending` 是
+/// 单槽邮箱，新快照会替换尚未消费的快照；`wake_pending` 将多次唤醒合并为一次。
+/// 断开连接会发布隐藏状态，关闭后则不再接受新快照。
+#[derive(Default)]
+pub struct Mailbox {
+    /// 当前仍连接并拥有呈现状态的客户端；断开时清空。
+    pub owner: Option<Owner>,
+    /// 已获准发布状态的最大所有者编号，断开当前所有者后仍保留。
+    newest_owner: Owner,
+    /// 等待 UI 消费的最新状态；内层 `None` 表示应隐藏当前呈现。
+    pub pending: Option<(Owner, Option<RenderSnapshot>)>,
+    /// 是否已有一次唤醒等待 UI 处理，用于合并重复唤醒。
+    pub wake_pending: bool,
+    /// 终止标记；为真时拒绝快照并忽略断开请求。
+    pub closed: bool,
+    /// 当前所有者已接受的最大服务端序号，消费待处理快照后仍保留。
+    ///
+    /// 序号跨会话、令牌、显示和隐藏操作统一递增；只有更新的所有者接管时才重置。
+    latest_sequence: u64,
+}
+
+impl Mailbox {
+    /// 请求一次 UI 唤醒；若已有唤醒待处理则返回 `false`，避免重复排队。
+    pub fn schedule_wake(&mut self) -> bool {
+        if self.wake_pending {
+            return false;
+        }
+        self.wake_pending = true;
+        true
+    }
+
+    /// 取出最新待处理状态并清除唤醒标记。
+    ///
+    /// 即使邮箱为空也会清除标记，使后续新状态能够再次安排唤醒。
+    pub fn take_pending(&mut self) -> Option<(Owner, Option<RenderSnapshot>)> {
+        self.wake_pending = false;
+        self.pending.take()
+    }
+
+    /// 接受当前或更新所有者发布的快照，并替换邮箱中的待处理状态。
+    ///
+    /// 返回 `false` 表示邮箱已关闭、所有者已过期、序号为零，或当前所有者的
+    /// 序号没有严格递增。更大的所有者接管时可从任意非零序号开始。
+    pub fn render(&mut self, owner: Owner, snapshot: RenderSnapshot) -> bool {
+        if self.closed
+            || owner < self.newest_owner
+            || snapshot.sequence == 0
+            || (owner == self.newest_owner
+                && (self.owner != Some(owner) || snapshot.sequence <= self.latest_sequence))
+        {
+            return false;
+        }
+        self.latest_sequence = snapshot.sequence;
+        self.newest_owner = owner;
+        self.owner = Some(owner);
+        self.pending = Some((owner, Some(snapshot)));
+        true
+    }
+
+    /// 仅当调用者仍是当前所有者时，发布该连接的隐藏状态。
+    ///
+    /// 保留最近所有者和序号水位，防止断开后旧连接通过重放重新显示内容。
+    pub fn disconnect(&mut self, owner: Owner) -> bool {
+        if self.closed || self.owner != Some(owner) {
+            return false;
+        }
+        self.owner = None;
+        self.pending = Some((owner, None));
+        true
+    }
+}
+
+/// 校验待呈现快照的文本、候选数量、分页索引和锚点范围。
+///
+/// 超出传输与渲染边界时返回说明原因的错误；限制文本字节数和候选数量，避免
+/// 不可信快照占用过多内存或造成不受控的渲染工作量。
+pub fn validate(snapshot: &RenderSnapshot) -> Result<(), String> {
+    if let Some(preedit) = &snapshot.preedit {
+        crate::theme_api::Preedit {
+            text: preedit.text.clone(),
+            cursor: preedit.cursor_utf16,
+        }
+        .validate()?;
+    }
+    if snapshot.items.len() > MAX_ITEMS {
+        return Err("snapshot exceeds 256 items".into());
+    }
+    if let Some(indicator) = &snapshot.mode_indicator {
+        if indicator.id == 0
+            || !matches!(
+                weasel_common::message::ModeIndicatorReason::try_from(indicator.reason),
+                Ok(weasel_common::message::ModeIndicatorReason::Focus)
+                    | Ok(weasel_common::message::ModeIndicatorReason::UserSwitch)
+            )
+        {
+            return Err("invalid mode indicator".into());
+        }
+    }
+    let mut bytes = 0;
+    for item in &snapshot.items {
+        for text in [&item.primary_text, &item.secondary_text, &item.kind] {
+            if text.len() > 4096 || text.contains('\0') {
+                return Err("snapshot text exceeds 4096 bytes or contains NUL".into());
+            }
+            bytes += text.len();
+        }
+    }
+    if bytes > 65536 {
+        return Err("snapshot text exceeds 64 KiB".into());
+    }
+    if (snapshot.items.is_empty() && snapshot.selected_index != 0)
+        || (!snapshot.items.is_empty() && snapshot.selected_index as usize >= snapshot.items.len())
+        || snapshot
+            .page_start
+            .checked_add(snapshot.items.len() as u32)
+            .is_none()
+        || snapshot.total_item_count.is_some_and(|total| {
+            snapshot
+                .page_start
+                .saturating_add(snapshot.items.len() as u32)
+                > total
+        })
+    {
+        return Err("invalid snapshot index/count".into());
+    }
+    if let Some(anchor) = &snapshot.anchor {
+        if anchor.valid
+            && (anchor.left > anchor.right
+                || anchor.top > anchor.bottom
+                || [anchor.left, anchor.right, anchor.top, anchor.bottom]
+                    .iter()
+                    .any(|v| !(-1_000_000..=1_000_000).contains(v)))
+        {
+            return Err("invalid snapshot anchor".into());
+        }
+    }
+    Ok(())
+}
+
+/// 比较两个快照的呈现内容，忽略序号和锚点等布局更新字段。
+///
+/// 该判断用于区分内容变化与仅影响布局的更新；会话、令牌、修订号或候选内容
+/// 任一变化都视为内容不同。
+pub fn same_content(a: &RenderSnapshot, b: &RenderSnapshot) -> bool {
+    a.session_id == b.session_id
+        && a.active == b.active
+        && a.ascii_mode == b.ascii_mode
+        && match (&a.mode_indicator, &b.mode_indicator) {
+            (None, None) => true,
+            (Some(a), Some(b)) => {
+                a.id == b.id && a.ascii_mode == b.ascii_mode && a.reason == b.reason
+            }
+            _ => false,
+        }
+        && a.preedit == b.preedit
+        && a.token == b.token
+        && a.revision == b.revision
+        && a.items == b.items
+        && a.selected_index == b.selected_index
+        && a.page_start == b.page_start
+        && a.total_item_count == b.total_item_count
+        && a.can_page_previous == b.can_page_previous
+        && a.can_page_next == b.can_page_next
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use weasel_common::message::ContextToken;
+
+    fn snapshot() -> RenderSnapshot {
+        RenderSnapshot {
+            visible: true,
+            sequence: 1,
+            ..Default::default()
+        }
+    }
+
+    fn versioned(
+        sequence: u64,
+        session: u64,
+        context: u64,
+        generation: u64,
+        revision: u64,
+    ) -> RenderSnapshot {
+        RenderSnapshot {
+            sequence,
+            session_id: session,
+            token: Some(ContextToken {
+                context_id: context,
+                connection_epoch: 1,
+                generation,
+            }),
+            revision,
+            ..snapshot()
+        }
+    }
+
+    #[test]
+    fn consumed_snapshots_still_reject_lower_or_equal_sequence() {
+        let mut mailbox = Mailbox::default();
+        assert!(mailbox.render(1, versioned(10, 1, 1, 3, 10)));
+        mailbox.take_pending();
+        assert!(!mailbox.render(1, versioned(9, 2, 2, 100, 100)));
+        assert!(!mailbox.render(1, versioned(10, 1, 1, 4, 100)));
+        assert!(!mailbox.render(1, versioned(0, 1, 1, 4, 100)));
+        assert!(mailbox.pending.is_none());
+        assert!(mailbox.render(1, versioned(11, 1, 1, 3, 10))); // Layout-only update.
+        assert!(mailbox.render(1, versioned(12, 1, 1, 1, 1))); // Publisher is authoritative.
+    }
+
+    #[test]
+    fn show_a_hide_b_and_reenter_a_with_unchanged_generation() {
+        let mut mailbox = Mailbox::default();
+        assert!(mailbox.render(1, versioned(1, 1, 1, 1, 5)));
+        let mut hidden = versioned(2, 2, 2, 1, 1);
+        hidden.visible = false;
+        assert!(mailbox.render(1, hidden.clone()));
+        assert!(!mailbox.take_pending().unwrap().1.unwrap().visible);
+        assert!(mailbox.render(1, versioned(3, 1, 1, 1, 6)));
+        assert!(!mailbox.render(1, hidden));
+        let current = mailbox.take_pending().unwrap().1.unwrap();
+        assert!(current.visible);
+        assert_eq!(current.session_id, 1);
+        assert_eq!(current.token.unwrap().generation, 1);
+    }
+
+    #[test]
+    fn cancel_hide_accepts_new_generation_and_rejects_replayed_show() {
+        let mut mailbox = Mailbox::default();
+        assert!(mailbox.render(1, versioned(1, 1, 1, 3, 10)));
+        let mut hidden = versioned(2, 1, 1, 4, 11);
+        hidden.visible = false;
+        assert!(mailbox.render(1, hidden));
+        assert!(!mailbox.render(1, versioned(1, 1, 1, 3, 10)));
+        assert!(!mailbox.render(1, versioned(2, 1, 1, 4, 12)));
+        assert!(
+            !mailbox
+                .pending
+                .as_ref()
+                .unwrap()
+                .1
+                .as_ref()
+                .unwrap()
+                .visible
+        );
+        assert!(mailbox.disconnect(1));
+    }
+
+    #[test]
+    fn new_owner_resets_sequence_and_can_start_with_hide() {
+        let mut mailbox = Mailbox::default();
+        assert!(!mailbox.render(1, versioned(0, 1, 1, 1, 1)));
+        assert!(mailbox.render(1, versioned(u64::MAX, 1, 1, 1, 1)));
+        let hidden = RenderSnapshot {
+            visible: false,
+            ..snapshot()
+        };
+        assert!(mailbox.render(2, hidden));
+        assert_eq!(mailbox.latest_sequence, 1);
+        assert!(!mailbox.disconnect(1));
+        assert!(!mailbox.render(1, versioned(u64::MAX, 1, 1, 1, 1)));
+        assert!(mailbox.disconnect(2));
+        assert!(!mailbox.render(2, versioned(2, 1, 1, 1, 1)));
+    }
+
+    #[test]
+    fn ownership_and_disconnect_are_ordered() {
+        let mut mailbox = Mailbox::default();
+        assert!(mailbox.render(1, snapshot()));
+        assert!(mailbox.render(2, snapshot()));
+        assert!(!mailbox.disconnect(1));
+        assert!(!mailbox.render(1, RenderSnapshot::default()));
+        assert!(!mailbox.render(1, snapshot()));
+        assert_eq!(mailbox.owner, Some(2));
+        assert!(mailbox.disconnect(2));
+        assert!(mailbox.pending.as_ref().unwrap().1.is_none());
+    }
+
+    #[test]
+    fn latest_snapshot_replaces_backlog() {
+        let mut mailbox = Mailbox::default();
+        let mut wakes = 0;
+        for revision in 0..10000 {
+            mailbox.render(
+                1,
+                RenderSnapshot {
+                    revision,
+                    sequence: revision + 1,
+                    ..snapshot()
+                },
+            );
+            wakes += usize::from(mailbox.schedule_wake());
+        }
+        assert_eq!(wakes, 1);
+        assert_eq!(mailbox.take_pending().unwrap().1.unwrap().revision, 9999);
+        assert!(mailbox.pending.is_none());
+        assert!(mailbox.render(
+            1,
+            RenderSnapshot {
+                revision: 10000,
+                sequence: 10001,
+                ..snapshot()
+            }
+        ));
+        assert!(mailbox.schedule_wake());
+    }
+
+    #[test]
+    fn disconnect_hide_is_replaced_by_new_owner_and_close_is_terminal() {
+        let mut mailbox = Mailbox::default();
+        mailbox.render(1, snapshot());
+        mailbox.disconnect(1);
+        mailbox.render(2, snapshot());
+        let (owner, pending) = mailbox.take_pending().unwrap();
+        assert_eq!(owner, 2);
+        assert!(pending.unwrap().visible);
+        mailbox.closed = true;
+        assert!(!mailbox.render(3, snapshot()));
+        assert!(!mailbox.disconnect(2));
+    }
+
+    #[test]
+    fn aggregate_text_and_page_bounds_are_checked() {
+        use weasel_common::message::RenderItem;
+        let mut s = snapshot();
+        s.items = vec![
+            RenderItem {
+                primary_text: "x".repeat(4096),
+                ..Default::default()
+            };
+            17
+        ];
+        assert!(validate(&s).is_err());
+        s.items.truncate(1);
+        s.page_start = u32::MAX;
+        assert!(validate(&s).is_err());
+        s.page_start = 10;
+        s.total_item_count = Some(10);
+        assert!(validate(&s).is_err());
+        s.total_item_count = Some(11);
+        assert!(validate(&s).is_ok());
+    }
+
+    #[test]
+    fn rejects_bad_payloads() {
+        use weasel_common::message::{RenderItem, RenderRect};
+        let mut s = snapshot();
+        s.items = vec![RenderItem::default(); 257];
+        assert!(validate(&s).is_err());
+        s.items.truncate(1);
+        s.items[0].primary_text = "x".repeat(4097);
+        assert!(validate(&s).is_err());
+        s.items[0].primary_text = "\0".into();
+        assert!(validate(&s).is_err());
+        s.items[0].primary_text.clear();
+        s.selected_index = 1;
+        assert!(validate(&s).is_err());
+        s.selected_index = 0;
+        s.anchor = Some(RenderRect {
+            valid: true,
+            left: i32::MIN,
+            ..Default::default()
+        });
+        assert!(validate(&s).is_err());
+        s.anchor = None;
+        assert!(validate(&s).is_ok());
+    }
+
+    #[test]
+    fn layout_only_retains_content_but_identity_changes_do_not() {
+        let a = snapshot();
+        let mut b = a.clone();
+        b.anchor = Some(Default::default());
+        b.sequence += 1;
+        assert!(same_content(&a, &b));
+        b.revision += 1;
+        assert!(!same_content(&a, &b));
+    }
+
+    #[test]
+    fn accepts_256_candidates_and_last_selection_but_rejects_257() {
+        let mut s = snapshot();
+        s.items = vec![weasel_common::message::RenderItem::default(); 256];
+        s.selected_index = 255;
+        s.total_item_count = Some(256);
+        assert!(validate(&s).is_ok());
+        s.selected_index = 256;
+        assert!(validate(&s).is_err());
+        s.selected_index = 255;
+        s.items.push(Default::default());
+        s.total_item_count = Some(257);
+        assert!(validate(&s).is_err());
+    }
+
+    #[test]
+    fn unknown_total_is_preserved_and_distinct_from_known_zero() {
+        let mut s = snapshot();
+        s.items.push(Default::default());
+        s.page_start = 10;
+        assert_eq!(s.total_item_count, None);
+        assert!(validate(&s).is_ok());
+        let mut mailbox = Mailbox::default();
+        assert!(mailbox.render(1, s.clone()));
+        assert_eq!(
+            mailbox.take_pending().unwrap().1.unwrap().total_item_count,
+            None
+        );
+        s.total_item_count = Some(0);
+        assert!(validate(&s).is_err());
+        s.items.clear();
+        assert!(validate(&s).is_err());
+        s.page_start = 0;
+        assert!(validate(&s).is_ok());
+    }
+}
